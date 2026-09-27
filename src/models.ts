@@ -33,6 +33,32 @@ export interface CourseModule {
   steps: LessonStep[];
 }
 
+export type TicketStatus = 'open' | 'resolved';
+
+export interface TicketEvent {
+  at: string;
+  action: 'created' | 'resolved' | 'reopened';
+  detail: string;
+  note?: string;
+}
+
+export interface IssueTicket {
+  id: string;
+  checkId: string;
+  title: string;
+  detail: string;
+  stepId?: string;
+  moduleId?: string;
+  assignee: string;
+  note: string;
+  reviewAt: string;
+  status: TicketStatus;
+  createdAt: string;
+  updatedAt: string;
+  resolvedAt?: string;
+  history: TicketEvent[];
+}
+
 export interface FrozenVersion {
   id: string;
   label: string;
@@ -49,6 +75,7 @@ export interface CourseProject {
   selectedModuleId: string;
   selectedStepId: string;
   modules: CourseModule[];
+  tickets: IssueTicket[];
   frozenVersions: FrozenVersion[];
   lastSavedAt: string;
   revision: number;
@@ -194,6 +221,7 @@ export function createDemoProject(): CourseProject {
     selectedModuleId: 'module-1',
     selectedStepId: 'step-1-2',
     modules,
+    tickets: [],
     frozenVersions: [],
     lastSavedAt: new Date().toISOString(),
     revision: 1,
@@ -249,6 +277,79 @@ export function validateProject(project: CourseProject): ValidationCheck[] {
   });
 
   return checks;
+}
+
+/**
+ * 把当前的阻断检查（error）同步成处理单：
+ * - 新出现的阻断检查自动生成待处理处理单；
+ * - 已修正的处理单若同一问题再次出现，自动回到待处理，旧说明留在处理记录里；
+ * - 步骤或模块被删除后，对应的处理单一并移除。
+ */
+export function syncTickets(project: CourseProject): CourseProject {
+  const now = new Date().toISOString();
+  const blocking = validateProject(project).filter((check) => check.severity === 'error');
+  const stepIds = new Set(project.modules.flatMap((module) => module.steps.map((step) => step.id)));
+  const moduleIds = new Set(project.modules.map((module) => module.id));
+
+  let changed = false;
+  let tickets = (project.tickets ?? []).filter((ticket) => {
+    const keep = ticket.stepId ? stepIds.has(ticket.stepId) : ticket.moduleId ? moduleIds.has(ticket.moduleId) : true;
+    if (!keep) changed = true;
+    return keep;
+  });
+
+  tickets = tickets.map((ticket) => {
+    const check = blocking.find((item) => item.id === ticket.checkId);
+    if (!check) return ticket;
+    if (ticket.status === 'resolved') {
+      changed = true;
+      return {
+        ...ticket,
+        status: 'open' as TicketStatus,
+        resolvedAt: undefined,
+        updatedAt: now,
+        title: check.title,
+        detail: check.detail,
+        stepId: check.stepId,
+        moduleId: check.moduleId,
+        history: [
+          ...ticket.history,
+          { at: now, action: 'reopened' as const, detail: '该问题再次出现，处理单自动回到待处理', note: ticket.note.trim() || undefined },
+        ],
+      };
+    }
+    if (ticket.title !== check.title || ticket.detail !== check.detail || ticket.stepId !== check.stepId || ticket.moduleId !== check.moduleId) {
+      changed = true;
+      return { ...ticket, title: check.title, detail: check.detail, stepId: check.stepId, moduleId: check.moduleId };
+    }
+    return ticket;
+  });
+
+  for (const check of blocking) {
+    if (!tickets.some((ticket) => ticket.checkId === check.id)) {
+      changed = true;
+      tickets = [
+        ...tickets,
+        {
+          id: `ticket-${check.id}`,
+          checkId: check.id,
+          title: check.title,
+          detail: check.detail,
+          stepId: check.stepId,
+          moduleId: check.moduleId,
+          assignee: '',
+          note: '',
+          reviewAt: '',
+          status: 'open' as TicketStatus,
+          createdAt: now,
+          updatedAt: now,
+          history: [{ at: now, action: 'created' as const, detail: '发布前检查未通过，自动生成处理单' }],
+        },
+      ];
+    }
+  }
+
+  return changed ? { ...project, tickets } : project;
 }
 
 export function cloneProject(project: CourseProject): CourseProject {
