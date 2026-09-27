@@ -23,6 +23,7 @@ export interface LessonStep {
   prerequisiteId: string;
   difficulty: Difficulty;
   cuePoints: number[];
+  fixTickets?: FixTicket[];
 }
 
 export interface CourseModule {
@@ -31,6 +32,7 @@ export interface CourseModule {
   summary: string;
   color: string;
   steps: LessonStep[];
+  fixTickets?: FixTicket[];
 }
 
 export interface FrozenVersion {
@@ -50,6 +52,7 @@ export interface CourseProject {
   selectedStepId: string;
   modules: CourseModule[];
   frozenVersions: FrozenVersion[];
+  fixTickets?: FixTicket[];
   lastSavedAt: string;
   revision: number;
 }
@@ -61,6 +64,44 @@ export interface ValidationCheck {
   detail: string;
   stepId?: string;
   moduleId?: string;
+}
+
+export type FixTicketStatus = 'open' | 'fixed';
+
+export interface FixTicketSnapshot {
+  owner: string;
+  note: string;
+  recheckAt: string;
+}
+
+export interface FixTicketHistoryEntry {
+  at: string;
+  type: 'created' | 'updated' | 'fixed' | 'reopened';
+  reason?: string;
+  snapshot: FixTicketSnapshot;
+}
+
+export interface FixTicket extends FixTicketSnapshot {
+  /** 与对应阻断检查 ValidationCheck.id 保持一致，用于复发对账 */
+  checkId: string;
+  severity: 'error';
+  title: string;
+  detail: string;
+  stepId?: string;
+  moduleId?: string;
+  status: FixTicketStatus;
+  createdAt: string;
+  updatedAt: string;
+  /** 复发次数：问题修正后再次出现时累加 */
+  recurrenceCount: number;
+  history: FixTicketHistoryEntry[];
+}
+
+export interface FixTicketView extends FixTicket {
+  moduleId?: string;
+  stepId?: string;
+  /** 当前检查结果中该问题是否仍存在 */
+  active: boolean;
 }
 
 export const STORAGE_KEY = 'sologsb-1012-sign-course-project-v1';
@@ -253,4 +294,150 @@ export function validateProject(project: CourseProject): ValidationCheck[] {
 
 export function cloneProject(project: CourseProject): CourseProject {
   return structuredClone(project);
+}
+
+type FixTicketHost = { fixTickets?: FixTicket[] };
+
+function findFixTicketHost(project: CourseProject, ticket: Pick<FixTicket, 'stepId' | 'moduleId'>): FixTicketHost | undefined {
+  if (ticket.stepId) {
+    for (const module of project.modules) {
+      const step = module.steps.find((item) => item.id === ticket.stepId);
+      if (step) return step;
+    }
+  }
+  if (ticket.moduleId) {
+    const module = project.modules.find((item) => item.id === ticket.moduleId);
+    if (module) return module;
+  }
+  return project;
+}
+
+function ticketSnapshot(ticket: FixTicket): FixTicketSnapshot {
+  return { owner: ticket.owner, note: ticket.note, recheckAt: ticket.recheckAt };
+}
+
+/**
+ * 对账处理单：当前仍存在的每个阻断检查都必须有一张处理单。
+ * - 新出现的阻断：自动建单（待处理）。
+ * - 已标记修正、但同一步骤编辑后问题再次出现：回到待处理并追加复发记录，旧说明与历史保留。
+ */
+export function reconcileFixTickets(project: CourseProject, now: string = new Date().toISOString()): void {
+  const activeErrors = new Map<string, ValidationCheck>();
+  for (const check of validateProject(project)) {
+    if (check.severity === 'error') activeErrors.set(check.id, check);
+  }
+
+  for (const bucket of collectFixTicketBuckets(project)) {
+    for (const ticket of bucket.tickets) {
+      const check = activeErrors.get(ticket.checkId);
+      if (check && ticket.status === 'fixed') {
+        ticket.status = 'open';
+        ticket.recurrenceCount += 1;
+        ticket.updatedAt = now;
+        ticket.history.push({
+          at: now,
+          type: 'reopened',
+          reason: '同一问题在后续编辑中再次出现',
+          snapshot: ticketSnapshot(ticket),
+        });
+      }
+      activeErrors.delete(ticket.checkId);
+    }
+  }
+
+  for (const check of activeErrors.values()) {
+    const host = findFixTicketHost(project, check) ?? project;
+    host.fixTickets ??= [];
+    const snapshot: FixTicketSnapshot = { owner: '', note: '', recheckAt: '' };
+    host.fixTickets.push({
+      ...snapshot,
+      checkId: check.id,
+      severity: 'error',
+      title: check.title,
+      detail: check.detail,
+      stepId: check.stepId,
+      moduleId: check.moduleId,
+      status: 'open',
+      createdAt: now,
+      updatedAt: now,
+      recurrenceCount: 0,
+      history: [{ at: now, type: 'created', snapshot }],
+    });
+  }
+}
+
+function collectFixTicketBuckets(project: CourseProject): { host: FixTicketHost; tickets: FixTicket[] }[] {
+  const buckets: { host: FixTicketHost; tickets: FixTicket[] }[] = [];
+  for (const module of project.modules) {
+    for (const step of module.steps) {
+      if (step.fixTickets?.length) buckets.push({ host: step, tickets: step.fixTickets });
+    }
+    if (module.fixTickets?.length) buckets.push({ host: module, tickets: module.fixTickets });
+  }
+  if (project.fixTickets?.length) buckets.push({ host: project, tickets: project.fixTickets });
+  return buckets;
+}
+
+export function collectFixTickets(project: CourseProject): FixTicketView[] {
+  const activeErrors = new Set(validateProject(project).filter((check) => check.severity === 'error').map((check) => check.id));
+  const views: FixTicketView[] = [];
+  for (const { tickets } of collectFixTicketBuckets(project)) {
+    for (const ticket of tickets) {
+      views.push({ ...ticket, active: activeErrors.has(ticket.checkId) });
+    }
+  }
+  return views;
+}
+
+export function updateFixTicketInProject(
+  project: CourseProject,
+  checkId: string,
+  patch: Partial<Pick<FixTicket, 'owner' | 'note' | 'recheckAt'>>,
+  options: { record?: boolean; now?: string } = {},
+): boolean {
+  const now = options.now ?? new Date().toISOString();
+  for (const bucket of collectFixTicketBuckets(project)) {
+    const ticket = bucket.tickets.find((item) => item.checkId === checkId);
+    if (!ticket) continue;
+    Object.assign(ticket, patch);
+    ticket.updatedAt = now;
+    if (options.record) {
+      ticket.history.push({ at: now, type: 'updated', snapshot: ticketSnapshot(ticket) });
+    }
+    return true;
+  }
+  return false;
+}
+
+export function markFixTicketFixed(project: CourseProject, checkId: string, now: string = new Date().toISOString()): 'ok' | 'not-found' | 'still-failing' {
+  for (const bucket of collectFixTicketBuckets(project)) {
+    const ticket = bucket.tickets.find((item) => item.checkId === checkId);
+    if (!ticket) continue;
+    const stillFailing = validateProject(project).some((check) => check.severity === 'error' && check.id === ticket.checkId);
+    if (stillFailing) return 'still-failing';
+    ticket.status = 'fixed';
+    ticket.updatedAt = now;
+    ticket.history.push({ at: now, type: 'fixed', snapshot: ticketSnapshot(ticket) });
+    return 'ok';
+  }
+  return 'not-found';
+}
+
+export function reopenFixTicket(project: CourseProject, checkId: string, now: string = new Date().toISOString()): boolean {
+  for (const bucket of collectFixTicketBuckets(project)) {
+    const ticket = bucket.tickets.find((item) => item.checkId === checkId);
+    if (!ticket) continue;
+    if (ticket.status === 'fixed') {
+      ticket.status = 'open';
+      ticket.updatedAt = now;
+      ticket.history.push({ at: now, type: 'reopened', reason: '教师手动退回待处理', snapshot: ticketSnapshot(ticket) });
+    }
+    return true;
+  }
+  return false;
+}
+
+/** 阻断处理单中「仍存在且待处理」的数量；大于零时不允许提交复核或冻结。 */
+export function pendingBlockingTickets(project: CourseProject): FixTicketView[] {
+  return collectFixTickets(project).filter((ticket) => ticket.status === 'open' && ticket.active);
 }

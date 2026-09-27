@@ -1,16 +1,24 @@
 import { Component, Host, State, h, Listen } from '@stencil/core';
 import {
   cloneProject,
+  collectFixTickets,
   createDemoProject,
+  markFixTicketFixed,
+  pendingBlockingTickets,
+  reconcileFixTickets,
+  reopenFixTicket,
   selectedModule,
   selectedStep,
   STORAGE_KEY,
+  updateFixTicketInProject,
   validateProject,
   type CameraAngle,
   type CaptionPosition,
   type CourseModule,
   type CourseProject,
   type Difficulty,
+  type FixTicket,
+  type FixTicketHistoryEntry,
   type GestureZone,
   type LessonStep,
   type ValidationCheck,
@@ -31,6 +39,10 @@ export class AppRoot {
   @State() playProgress = 0;
   @State() offline = typeof navigator !== 'undefined' ? !navigator.onLine : false;
   @State() toast?: { color: string; message: string };
+  /** 提交复核/冻结被处理单拦截时，在检查区展示拦截横幅并逐条指出 */
+  @State() gateAction?: 'review' | 'freeze';
+  /** 记录本次聚焦后真正改动过的处理单字段，用于 blur 时只在有改动时写历史 */
+  private dirtyTicketFields = new Set<string>();
   private past: CourseProject[] = [];
   private future: CourseProject[] = [];
   private playTimer?: number;
@@ -41,6 +53,11 @@ export class AppRoot {
       if (saved) this.project = JSON.parse(saved) as CourseProject;
     } catch {
       this.project = createDemoProject();
+    }
+    // 为存量数据补建处理单；冻结版本保持快照不变
+    if (this.project.status !== 'frozen') {
+      reconcileFixTickets(this.project);
+      this.persist();
     }
   }
 
@@ -97,6 +114,14 @@ export class AppRoot {
     return validateProject(this.project);
   }
 
+  private get tickets(): FixTicket[] {
+    return collectFixTickets(this.project);
+  }
+
+  private get pendingTickets(): FixTicket[] {
+    return pendingBlockingTickets(this.project);
+  }
+
   private persist(): void {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(this.project));
   }
@@ -108,6 +133,8 @@ export class AppRoot {
     }
     const before = cloneProject(this.project);
     const next = update(cloneProject(this.project));
+    // 每次编辑后对账：新建阻断单、复发的处理单退回待处理
+    reconcileFixTickets(next);
     next.revision = before.revision + 1;
     next.lastSavedAt = new Date().toISOString();
     this.past = [...this.past, before].slice(-80);
@@ -121,6 +148,7 @@ export class AppRoot {
     const previous = this.past.pop();
     if (!previous) return this.showToast('medium', '没有可撤销的修改。');
     this.future = [cloneProject(this.project), ...this.future].slice(0, 80);
+    if (previous.status !== 'frozen') reconcileFixTickets(previous);
     this.project = previous;
     this.persist();
   }
@@ -129,6 +157,7 @@ export class AppRoot {
     const next = this.future.shift();
     if (!next) return;
     this.past = [...this.past, cloneProject(this.project)].slice(-80);
+    if (next.status !== 'frozen') reconcileFixTickets(next);
     this.project = next;
     this.persist();
   }
@@ -221,7 +250,10 @@ export class AppRoot {
       modules: draft.modules.map((module) => {
         if (module.id !== draft.selectedModuleId) return module;
         const index = module.steps.findIndex((item) => item.id === step.id);
-        const duplicate = { ...structuredClone(step), id: `step-${Date.now().toString(36)}`, title: `${step.title}（副本）` };
+        const duplicate = structuredClone(step);
+        delete duplicate.fixTickets;
+        duplicate.id = `step-${Date.now().toString(36)}`;
+        duplicate.title = `${step.title}（副本）`;
         return { ...module, steps: [...module.steps.slice(0, index + 1), duplicate, ...module.steps.slice(index + 1)] };
       }),
     }), '已复制当前步骤。');
@@ -271,10 +303,11 @@ export class AppRoot {
   }
 
   private submitForReview(): void {
-    const blocking = this.checks.filter((check) => check.severity === 'error');
-    if (blocking.length) {
+    const pending = this.pendingTickets;
+    if (pending.length) {
       this.activePanel = 'checks';
-      this.showToast('danger', `仍有 ${blocking.length} 个阻断问题，修复后才能提交复核。`);
+      this.gateAction = 'review';
+      this.showToast('danger', `仍有 ${pending.length} 个未处理阻断项，处理并标记修正后才能提交复核。`);
       return;
     }
     this.commit((draft) => ({ ...draft, status: 'review' }), '课程已提交复核。');
@@ -285,10 +318,11 @@ export class AppRoot {
   }
 
   private freezeVersion(): void {
-    const blocking = this.checks.filter((check) => check.severity === 'error');
-    if (blocking.length) {
+    const pending = this.pendingTickets;
+    if (pending.length) {
       this.activePanel = 'checks';
-      this.showToast('danger', `冻结前仍有 ${blocking.length} 个阻断问题。`);
+      this.gateAction = 'freeze';
+      this.showToast('danger', `冻结前仍有 ${pending.length} 个未处理阻断项，请逐条查看检查项。`);
       return;
     }
     this.commit((draft) => {
@@ -306,6 +340,55 @@ export class AppRoot {
 
   private reviseFrozen(): void {
     this.commit((draft) => ({ ...draft, status: 'draft' }), '已创建修订版，可继续编辑。');
+  }
+
+  private jumpToTicket(ticket: Pick<FixTicket, 'moduleId' | 'stepId'>): void {
+    if (ticket.moduleId) this.selectModule(ticket.moduleId);
+    if (ticket.stepId) this.selectStep(ticket.stepId);
+    this.activePanel = 'editor';
+  }
+
+  private typeTicketField(checkId: string, field: 'owner' | 'note' | 'recheckAt', value: string): void {
+    this.dirtyTicketFields.add(`${checkId}:${field}`);
+    this.commit((draft) => {
+      updateFixTicketInProject(draft, checkId, { [field]: value } as Partial<Pick<FixTicket, 'owner' | 'note' | 'recheckAt'>>);
+      return draft;
+    });
+  }
+
+  private commitTicketField(checkId: string, field: 'owner' | 'note' | 'recheckAt'): void {
+    if (!this.dirtyTicketFields.delete(`${checkId}:${field}`)) return;
+    const value = this.tickets.find((ticket) => ticket.checkId === checkId)?.[field] ?? '';
+    this.commit((draft) => {
+      updateFixTicketInProject(draft, checkId, { [field]: value } as Partial<Pick<FixTicket, 'owner' | 'note' | 'recheckAt'>>, { record: true });
+      return draft;
+    }, '处理单说明已保存。');
+  }
+
+  private changeTicketRecheck(checkId: string, value: string): void {
+    this.commit((draft) => {
+      updateFixTicketInProject(draft, checkId, { recheckAt: value }, { record: true });
+      return draft;
+    }, '复查时间已记录。');
+  }
+
+  private markTicketFixed(checkId: string): void {
+    const stillFailing = this.checks.some((check) => check.severity === 'error' && check.id === checkId);
+    if (stillFailing) {
+      this.showToast('danger', '该阻断检查仍未通过，请先修改步骤内容，再标记为已修正。');
+      return;
+    }
+    this.commit((draft) => {
+      markFixTicketFixed(draft, checkId);
+      return draft;
+    }, '已标记为修正，等待复查确认。');
+  }
+
+  private reopenTicket(checkId: string): void {
+    this.commit((draft) => {
+      reopenFixTicket(draft, checkId);
+      return draft;
+    }, '处理单已退回待处理。');
   }
 
   private togglePlay(): void {
@@ -511,20 +594,197 @@ export class AppRoot {
     );
   }
 
+  private ticketScopeLabel(ticket: Pick<FixTicket, 'moduleId' | 'stepId'>): string {
+    const module = this.project.modules.find((item) => item.id === ticket.moduleId);
+    const step = module?.steps.find((item) => item.id === ticket.stepId);
+    if (module && step) return `${module.title} / ${step.title}`;
+    if (module) return module.title;
+    return '课程整体';
+  }
+
+  private renderTicketHistory(entry: FixTicketHistoryEntry) {
+    const label = {
+      created: '建单',
+      updated: '更新说明',
+      fixed: '标记已修正',
+      reopened: entry.reason ? `复发退回（${entry.reason}）` : '退回待处理',
+    }[entry.type];
+    return (
+      <li class={`ticket-history-item ${entry.type}`}>
+        <div class="ticket-history-head">
+          <span class="ticket-history-type">{label}</span>
+          <span class="ticket-history-time">{this.formatDate(entry.at)}</span>
+        </div>
+        <p>
+          {entry.snapshot.owner ? `负责人：${entry.snapshot.owner}` : '负责人：未分配'}
+          {entry.snapshot.recheckAt ? ` · 复查：${this.formatDate(entry.snapshot.recheckAt)}` : ''}
+        </p>
+        {entry.snapshot.note && <blockquote>{entry.snapshot.note}</blockquote>}
+      </li>
+    );
+  }
+
+  private renderTicketCard(ticket: FixTicket & { active: boolean }) {
+    const frozen = this.project.status === 'frozen';
+    const open = ticket.status === 'open';
+    return (
+      <article class={`ticket-card ${open ? 'open' : 'fixed'} ${ticket.active ? 'active' : 'stale'}`}>
+        <div class="ticket-head">
+          <span class={`ticket-status-dot ${open ? 'open' : 'fixed'}`}>{open ? '待处理' : '已修正'}</span>
+          <button class="ticket-scope" onClick={() => this.jumpToTicket(ticket)}>
+            {this.ticketScopeLabel(ticket)} <span class="check-arrow">→</span>
+          </button>
+          {ticket.recurrenceCount > 0 && <span class="ticket-recurrence">已复发 {ticket.recurrenceCount} 次</span>}
+        </div>
+        <div class="ticket-title-row">
+          <span class="check-severity error-mark">!</span>
+          <div>
+            <strong>{ticket.title}</strong>
+            <small>{ticket.detail}</small>
+            {!ticket.active && open && <em class="ticket-hint">当前检查已不再报出此问题，确认处理记录后可标记修正。</em>}
+          </div>
+        </div>
+
+        <div class="ticket-fields">
+          <ion-input
+            disabled={frozen}
+            label="负责人"
+            labelPlacement="stacked"
+            placeholder="例如：陈老师"
+            class="studio-input"
+            value={ticket.owner}
+            onIonInput={(event) => this.typeTicketField(ticket.checkId, 'owner', event.detail.value ?? '')}
+            onIonBlur={() => this.commitTicketField(ticket.checkId, 'owner')}
+          />
+          <ion-input
+            disabled={frozen}
+            type="datetime-local"
+            label="复查时间"
+            labelPlacement="stacked"
+            class="studio-input"
+            value={ticket.recheckAt}
+            onIonChange={(event) => this.changeTicketRecheck(ticket.checkId, event.detail.value ?? '')}
+          />
+          <ion-textarea
+            disabled={frozen}
+            autoGrow
+            label="处理说明"
+            labelPlacement="stacked"
+            placeholder="记录修改内容、复查结论或协作备注"
+            class="studio-input"
+            value={ticket.note}
+            onIonInput={(event) => this.typeTicketField(ticket.checkId, 'note', event.detail.value ?? '')}
+            onIonBlur={() => this.commitTicketField(ticket.checkId, 'note')}
+          />
+        </div>
+
+        <div class="ticket-actions">
+          {open
+            ? <ion-button color="success" size="small" class="studio-button" disabled={frozen} onClick={() => this.markTicketFixed(ticket.checkId)}>标记为已修正</ion-button>
+            : <ion-button fill="outline" size="small" class="studio-button" disabled={frozen} onClick={() => this.reopenTicket(ticket.checkId)}>退回待处理</ion-button>}
+          <span class="ticket-updated">建单 {this.formatDate(ticket.createdAt)} · 最近变更 {this.formatDate(ticket.updatedAt)}</span>
+        </div>
+
+        <details class="ticket-history">
+          <summary>变更记录（{ticket.history.length}）</summary>
+          <ul>{ticket.history.map((entry) => this.renderTicketHistory(entry))}</ul>
+        </details>
+      </article>
+    );
+  }
+
+  private renderOwnerBoard(tickets: (FixTicket & { active: boolean })[]) {
+    const groups = new Map<string, (FixTicket & { active: boolean })[]>();
+    for (const ticket of tickets) {
+      const owner = ticket.owner.trim() || '未分配';
+      groups.set(owner, [...(groups.get(owner) ?? []), ticket]);
+    }
+    const owners = [...groups.keys()].sort((a, b) => (a === '未分配' ? -1 : b === '未分配' ? 1 : a.localeCompare(b, 'zh-CN')));
+    return (
+      <section class="owner-board">
+        <div class="owner-board-head">
+          <span class="eyebrow">按负责人汇总</span>
+          <strong>{tickets.length} 个未处理阻断项</strong>
+        </div>
+        {owners.map((owner) => (
+          <div class={`owner-group ${owner === '未分配' ? 'unassigned' : ''}`}>
+            <div class="owner-name"><span class="owner-avatar">{owner.slice(0, 1)}</span><strong>{owner}</strong><em>{groups.get(owner)!.length} 项</em></div>
+            <ul>
+              {groups.get(owner)!.map((ticket) => (
+                <li>
+                  <button class="owner-ticket-link" onClick={() => this.jumpToTicket(ticket)}>
+                    <span>{ticket.title}</span>
+                    <small>{this.ticketScopeLabel(ticket)}</small>
+                  </button>
+                  {!ticket.active && <span class="owner-pending-check">检查已通过，待标记</span>}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </section>
+    );
+  }
+
+  private renderGateBanner(pending: FixTicket[]) {
+    if (!this.gateAction) return null;
+    const actionLabel = this.gateAction === 'review' ? '提交复核' : '冻结版本';
+    return (
+      <div class="gate-banner">
+        <div class="gate-banner-head">
+          <strong>无法{actionLabel}</strong>
+          <button class="gate-dismiss" onClick={() => { this.gateAction = undefined; }}>×</button>
+        </div>
+        <p>以下 {pending.length} 个检查项仍处于未处理状态，请逐条处理后再{actionLabel}：</p>
+        <ol>
+          {pending.map((ticket) => (
+            <li>
+              <button class="gate-ticket-link" onClick={() => this.jumpToTicket(ticket)}>
+                <span class="gate-ticket-title">{ticket.title}</span>
+                <small>{this.ticketScopeLabel(ticket)} · 负责人 {ticket.owner.trim() || '未分配'}</small>
+              </button>
+            </li>
+          ))}
+        </ol>
+      </div>
+    );
+  }
+
   private renderChecks() {
-    const errors = this.checks.filter((check) => check.severity === 'error');
+    const tickets = this.tickets as (FixTicket & { active: boolean })[];
+    const pending = tickets.filter((ticket) => ticket.status === 'open' && ticket.active);
+    const staleOpen = tickets.filter((ticket) => ticket.status === 'open' && !ticket.active);
+    const fixed = tickets.filter((ticket) => ticket.status === 'fixed');
     const warnings = this.checks.filter((check) => check.severity === 'warning');
     const info = this.checks.filter((check) => check.severity === 'info');
+    const openTickets = [...pending, ...staleOpen];
     return (
       <section class="checks-panel">
         <div class="checks-summary">
-          <div class="check-stat danger"><strong>{errors.length}</strong><span>阻断问题</span></div>
+          <div class={`check-stat danger ${pending.length ? 'lit' : ''}`}><strong>{pending.length}</strong><span>未处理阻断</span></div>
+          <div class="check-stat fixed-stat"><strong>{fixed.length}</strong><span>已修正处理单</span></div>
           <div class="check-stat warning"><strong>{warnings.length}</strong><span>需注意</span></div>
           <div class="check-stat"><strong>{info.length}</strong><span>优化建议</span></div>
         </div>
+
+        {pending.length > 0 && this.renderGateBanner(pending)}
+        {openTickets.length > 0 && this.renderOwnerBoard(openTickets)}
+
         <div class="check-list">
           {this.checks.length === 0 && <div class="all-clear"><strong>✓ 未发现问题</strong><p>字幕遮挡、步骤跳级和替代文本检查均已通过。</p></div>}
-          {this.checks.map((check) => (
+
+          {openTickets.length > 0 && <h3 class="check-group-title">阻断处理单 · 待处理（{openTickets.length}）</h3>}
+          {openTickets.map((ticket) => this.renderTicketCard(ticket))}
+
+          {fixed.length > 0 && (
+            <details class="fixed-tickets" open={pending.length === 0}>
+              <summary>已修正处理单（{fixed.length}）· 若问题再次出现将自动退回待处理</summary>
+              {fixed.map((ticket) => this.renderTicketCard(ticket))}
+            </details>
+          )}
+
+          {(warnings.length > 0 || info.length > 0) && <h3 class="check-group-title muted">非阻断提醒（{warnings.length + info.length}）</h3>}
+          {[...warnings, ...info].map((check) => (
             <button class={`check-item ${check.severity}`} onClick={() => {
               if (check.moduleId) this.selectModule(check.moduleId);
               if (check.stepId) this.selectStep(check.stepId);
@@ -542,7 +802,7 @@ export class AppRoot {
 
   render() {
     const module = this.currentModule;
-    const errors = this.checks.filter((check) => check.severity === 'error').length;
+    const errors = this.pendingTickets.length;
     return (
       <Host>
         <ion-app>
@@ -569,7 +829,7 @@ export class AppRoot {
             <div class="project-ribbon">
               <div class="project-heading">
                 {this.renderStatusBadge()}
-                <ion-input value={this.project.title} class="project-title-input" onIonInput={(event) => { this.project = { ...this.project, title: event.detail.value ?? '' }; this.persist(); }} />
+                <ion-input value={this.project.title} disabled={this.project.status === 'frozen'} class="project-title-input" onIonInput={(event) => { this.commit((draft) => ({ ...draft, title: event.detail.value ?? '' })); }} />
                 <span>{this.project.teacher} · {this.project.audience}</span>
               </div>
               <div class="project-metrics">
@@ -608,7 +868,7 @@ export class AppRoot {
               <section class="editor-panel">
                 <div class="panel-switcher">
                   <button class={this.activePanel === 'editor' ? 'active' : ''} onClick={() => { this.activePanel = 'editor'; }}>步骤编排</button>
-                  <button class={this.activePanel === 'checks' ? 'active' : ''} onClick={() => { this.activePanel = 'checks'; }}>发布前检查 <span>{this.checks.length}</span></button>
+                  <button class={this.activePanel === 'checks' ? 'active' : ''} onClick={() => { this.activePanel = 'checks'; }}>发布前检查 {this.pendingTickets.length > 0 && <span class="badge-danger">{this.pendingTickets.length}</span>}</button>
                 </div>
                 <div class="editor-scroll">{this.activePanel === 'editor' ? this.renderStepEditor() : this.renderChecks()}</div>
               </section>
